@@ -1,14 +1,71 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, CachedMetadata, Editor, FrontMatterCache, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from 'obsidian';
 
 // Remember to rename these classes and interfaces!
 
 interface MyPluginSettings {
 	mySetting: string;
+	actions: Map<string, Action>;
+}
+
+// Targets, specifies whether the file should be affected by the rule
+type Targets = {
+	ParentFolder: string | null,
+	HasTags: string[] | null,
+	HasProperties: string[] | null,
+}
+
+// RuleGroup, is a condition that's checked to determine if a modification should occur
+type RuleGroup = {
+	Rules: Rule[],
+	Operator: Op,
+}
+type Rule = {
+	Type: AttrType,
+	Check: RuleCheck,
+	Not: boolean,
+	
+	ValueStrings: string[],
+	ValueNum: number,
+}
+enum AttrType {
+	Tag,
+	Property,
+	Link
+}
+enum RuleCheck {
+	Has,
+
+	Equal,
+	GreaterThan,
+	LessThan,
+}
+enum Op {
+	And,
+	Or,
+}
+
+// Modifications, are applied to a note if a `RuleGroup` evaluates to true
+type Modification = {
+	Add: boolean,
+	Type: AttrType,
+	Values: any[],
+}
+
+type Action = {
+	targets: Targets,
+	rules: RuleGroup,
+	modifications: Modification[],
 }
 
 const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+	mySetting: 'default',
+	actions: new Map<string, Action>(),
 }
+
+
+// Modal UI
+// Dropdown, with Plus button
+// 
 
 export default class MyPlugin extends Plugin {
 	settings: MyPluginSettings;
@@ -21,17 +78,11 @@ export default class MyPlugin extends Plugin {
 			// Called when the user clicks the icon.
 			new Notice('This is a notice!');
 		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
 
 		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
+			id: 'open-conditions-modal',
+			name: 'Condition',
 			callback: () => {
 				new SampleModal(this.app).open();
 			}
@@ -76,6 +127,27 @@ export default class MyPlugin extends Plugin {
 
 		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
 		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+
+		this.app.metadataCache.on('changed', (file, data, _) => {
+			// SHOULD this file be checked
+			const fileMeta = this.app.metadataCache.getFileCache(file);
+			if (fileMeta === null) {
+				return;
+			}
+			this.settings.actions.forEach((act, _k) => {
+				const isTarget = this.evaluateTarget(file, fileMeta, act.targets);
+				if (!isTarget) {
+					return;
+				}
+				
+				// CHECK conditions
+				if (this.meetsConditions(fileMeta, act.rules)) {
+					// TODO: MODIFY
+					this.modify(file, data, act.modifications);
+				}
+			})
+
+		})
 	}
 
 	onunload() {
@@ -88,6 +160,114 @@ export default class MyPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	evaluateTarget(file: TFile, fileMeta: CachedMetadata, rules: Targets) {
+		return (
+			(rules.ParentFolder === null || file.path.startsWith(rules.ParentFolder)) &&
+			(rules.HasTags === null || fileMeta.tags !== undefined && this.containsAll(rules.HasTags, fileMeta.tags.map(t => t.tag))) &&
+			(rules.HasProperties === null || fileMeta.frontmatter !== undefined && this.containsAllKeys(rules.HasProperties, fileMeta.frontmatter))
+		)
+	}
+
+	containsAll(targets: string[], arr: string[]): boolean {
+		const m = new Map<string, boolean>();
+		arr.forEach(el => {
+			m.set(el, true);
+		})
+
+		for (let i = 0; i < targets.length; i++) {
+			if (!m.has(targets[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	containsAllKeys(targets: string[], m: FrontMatterCache): boolean {
+		for (let i = 0; i < targets.length; i++) {
+			if (m[targets[i]] === undefined) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	meetsConditions(fileMeta: CachedMetadata, rules: RuleGroup) {
+		const results: boolean[] = [];
+		rules.Rules.forEach(r => {
+			let res: boolean = false;
+			let value: string[];
+			switch (r.Type) {
+				case AttrType.Link:
+					value = fileMeta.links ? fileMeta.links.map(l => l.link) : [];
+					break;
+				case AttrType.Property:
+					value = fileMeta.frontmatter ? Object.keys(fileMeta.frontmatter) : [];
+					break;
+				case AttrType.Tag:
+					value = fileMeta.tags ? fileMeta.tags.map(t => t.tag) : [];
+					break;
+			}
+
+			switch(r.Check) {
+				case RuleCheck.Has:
+					res = this.containsAll(r.ValueStrings, value);
+					break;
+				case RuleCheck.Equal:
+					res = value.length === r.ValueNum;
+					break;
+				case RuleCheck.GreaterThan:
+					res = value.length > r.ValueNum;
+					break;
+				case RuleCheck.LessThan:
+					res = value.length < r.ValueNum;
+					break;
+			}
+
+			if (r.Not) {
+				res = !res;
+			}
+			results.push(res);
+		});
+	
+		if (rules.Operator === Op.And) {
+			return results.reduce((acc, curr) => acc && curr, true);
+		}
+		return results.reduce((acc, curr) => acc || curr, false);
+	}
+
+	modify(file: TFile, data: string, modifications: Modification[]) {
+		const modifiesFrontmatter = modifications.map(m => m.Type).includes(AttrType.Property)
+		const properties: [string, string][] = [];
+		if (modifiesFrontmatter) {
+			const splitOnFrontmatter = data.split('---');
+			let frontmatterString = '';
+			if (splitOnFrontmatter.length > 2) {
+				frontmatterString = splitOnFrontmatter[1];
+				frontmatterString.split('\n').map(kv => kv.trim()).forEach(kv => {
+					const parts = kv.split(':');
+					if (parts.length < 2) {
+						return;
+					}
+	
+					const k = parts[0].trim();
+					const v = parts[1].trim();
+					properties.push([k, v]);
+				})
+			}
+		}
+
+		modifications.forEach(m => {
+			switch(m.Type) {
+				case AttrType.Link:
+					break;
+				case AttrType.Property:
+					break;
+				case AttrType.Tag:
+					break;
+			}
+		});
 	}
 }
 
